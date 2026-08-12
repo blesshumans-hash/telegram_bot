@@ -1,0 +1,328 @@
+import datetime
+import logging
+import threading  # <-- Цей імпорт був пропущений
+import time
+import requests
+import telebot
+from bs4 import BeautifulSoup
+import re
+from typing import List, Dict, Optional
+import os  # Для роботи зі змінними середовища
+
+# ==========================================
+# 1. КОНФІГУРАЦІЯ
+# ==========================================
+# Використовуйте змінні середовища для безпеки!
+BOT_TOKEN = "8711802787:AAEM5m_-fL_gd2k1IJbPrOihEIjjb_FWWAc"
+CHAT_ID = 5027545957
+
+# Інтервал перевірки (секунд)
+CHECK_INTERVAL = 30
+
+# Ключові локації для фільтрації
+TARGET_LOCATIONS = [
+    "київ", "києві", "київська", "київщин",
+    "бровар", "броварах", "броварський", "броварського",
+    "бориспіль", "вишгород", "васильків", "обухів",
+    "ірпінь", "буча", "гостомель", "біла церква"
+]
+
+# Ключові слова загроз
+THREAT_KEYWORDS = [
+    "бпла", "шахед", "shahed", "дрон", "безпілотник",
+    "ракета", "ракет", "ракетний", "крилата",
+    "курс", "напрямок", "вектор", "рух",
+    "повз", "в районі", "у бік", "наближає",
+    "загроза", "локаційно", "небезпека",
+    "пуск", "запуск", "зліт"
+]
+
+# Список джерел
+SOURCES = [
+    {
+        "name": "Повітряні Сили ЗСУ",
+        "url": "https://t.me/s/kpszsu",
+        "priority": 1
+    },
+    {
+        "name": "Николаевский Ванёк",
+        "url": "https://t.me/s/vanek_nikolaev",
+        "priority": 2
+    }
+]
+
+# Налаштування логування
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+bot = telebot.TeleBot(BOT_TOKEN)
+processed_posts = set()
+
+
+# ==========================================
+# 2. ФУНКЦІЇ АНАЛІЗУ ТА ПАРСИНГУ
+# ==========================================
+def extract_location_and_threat(text: str) -> Dict:
+    """Аналізує текст на наявність локацій та загроз"""
+    text_lower = text.lower()
+    result = {
+        "is_relevant": False,
+        "location": None,
+        "threat_type": None,
+        "urgency": "normal"
+    }
+
+    # Визначення локації
+    for loc in TARGET_LOCATIONS:
+        if loc in text_lower:
+            result["location"] = loc
+            break
+
+    # Визначення типу загрози
+    if any(word in text_lower for word in ["шахед", "shahed"]):
+        result["threat_type"] = "shahed"
+        result["urgency"] = "high"
+    elif any(word in text_lower for word in ["ракета", "ракет"]):
+        result["threat_type"] = "missile"
+        result["urgency"] = "critical"
+    elif any(word in text_lower for word in ["бпла", "дрон", "безпілотник"]):
+        result["threat_type"] = "drone"
+        result["urgency"] = "high"
+
+    # Перевірка наявності ключових слів загрози
+    has_threat = any(word in text_lower for word in THREAT_KEYWORDS)
+
+    result["is_relevant"] = (result["location"] is not None) and has_threat
+    return result
+
+
+def clean_text(text: str) -> str:
+    """Очищення тексту від зайвих символів"""
+    # Видаляємо емодзі та спеціальні символи
+    text = re.sub(r'[^\w\s.,!?\-:;()"]', ' ', text)
+    # Видаляємо зайві пробіли
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def parse_channel(source_info: Dict) -> List[Dict]:
+    """Парсинг Telegram каналу"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8"
+    }
+
+    parsed_posts = []
+
+    try:
+        response = requests.get(
+            source_info["url"],
+            headers=headers,
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            logging.warning(f"Статус {response.status_code} для {source_info['name']}")
+            return parsed_posts
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        messages = soup.find_all("div", class_="tgme_widget_message")
+
+        for msg in messages[:5]:  # Беремо останні 5 повідомлень
+            post_id = msg.get("data-post")
+            if not post_id:
+                continue
+
+            text_div = msg.find("div", class_="tgme_widget_message_text")
+            if not text_div:
+                continue
+
+            text = clean_text(text_div.get_text(separator="\n").strip())
+
+            if len(text) < 10:
+                continue
+
+            parsed_posts.append({
+                "id": post_id,
+                "text": text,
+                "source_name": source_info["name"],
+                "priority": source_info.get("priority", 3)
+            })
+
+    except Exception as e:
+        logging.error(f"Помилка парсингу {source_info['name']}: {e}")
+
+    return parsed_posts
+
+
+# ==========================================
+# 3. ФОРМАТУВАННЯ ПОВІДОМЛЕНЬ
+# ==========================================
+def format_alert_message(post: Dict, analysis: Dict) -> str:
+    """Форматування сповіщення"""
+    text = post["text"]
+    source_name = post["source_name"]
+    now_str = datetime.datetime.now().strftime("%H:%M:%S")
+
+    # Визначаємо емодзі та заголовок
+    if analysis["urgency"] == "critical":
+        emoji = "🔴⚠️"
+        title = "КРИТИЧНА ЗАГРОЗА!"
+    elif analysis["urgency"] == "high":
+        emoji = "🟠⚠️"
+        title = "ВИСОКА ЗАГРОЗА"
+    else:
+        emoji = "🟡"
+        title = "ПОПЕРЕДЖЕННЯ"
+
+    # Визначаємо локацію
+    location = analysis["location"].upper() if analysis["location"] else "НЕВІДОМО"
+
+    # Визначаємо тип загрози
+    threat_type = {
+        "shahed": "🇮🇷 Шахед",
+        "missile": "🚀 Ракета",
+        "drone": "🛸 Дрон"
+    }.get(analysis["threat_type"], "⚠️ Невідома загроза")
+
+    msg_text = (
+        f"{emoji} **{title}**\n\n"
+        f"📍 **Локація:** {location}\n"
+        f"🎯 **Тип:** {threat_type}\n\n"
+        f"📋 **Повідомлення:**\n"
+        f"_{text[:300]}..._\n\n"
+        f"🕒 **Час:** `{now_str}`\n"
+        f"📢 **Джерело:** {source_name}"
+    )
+
+    return msg_text
+
+
+# ==========================================
+# 4. ОСНОВНА ЛОГІКА МОНІТОРИНГУ
+# ==========================================
+def monitor_all_sources():
+    """Основний цикл моніторингу"""
+    logging.info(f"🚀 Запущено моніторинг {len(SOURCES)} джерел")
+
+    while True:
+        try:
+            for source in SOURCES:
+                posts = parse_channel(source)
+
+                for post in posts:
+                    post_id = post["id"]
+
+                    if post_id in processed_posts:
+                        continue
+
+                    processed_posts.add(post_id)
+
+                    # Аналізуємо текст
+                    analysis = extract_location_and_threat(post["text"])
+
+                    if analysis["is_relevant"]:
+                        alert_text = format_alert_message(post, analysis)
+
+                        try:
+                            bot.send_message(
+                                CHAT_ID,
+                                alert_text,
+                                parse_mode="Markdown"
+                            )
+                            logging.info(f"[{source['name']}] Сповіщення надіслано")
+                        except Exception as e:
+                            logging.error(f"Помилка відправки: {e}")
+
+                time.sleep(2)
+
+        except Exception as e:
+            logging.error(f"Помилка в циклі: {e}")
+            time.sleep(10)
+
+        time.sleep(CHECK_INTERVAL)
+
+
+# ==========================================
+# 5. КОМАНДИ БОТА
+# ==========================================
+@bot.message_handler(commands=["start", "help"])
+def send_welcome(message):
+    sources_list = "\n".join([f"• {s['name']}" for s in SOURCES])
+    welcome_text = (
+        "🛡️ **Бот моніторингу повітряних загроз**\n\n"
+        f"📡 Активні джерела:\n{sources_list}\n\n"
+        "📍 Моніторинг: Київ, Київська область, Бровари\n\n"
+        "**Команди:**\n"
+        "/status — стан бота\n"
+        "/sources — всі джерела\n"
+        "/test — тестове сповіщення"
+    )
+    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["status"])
+def check_status(message):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    status_text = (
+        f"🟢 **Бот активний**\n"
+        f"⏰ Час: `{now}`\n"
+        f"📊 Джерел: {len(SOURCES)}\n"
+        f"🔄 Перевірка: кожні {CHECK_INTERVAL}с\n"
+        f"📝 Опрацьовано: {len(processed_posts)} повідомлень"
+    )
+    bot.reply_to(message, status_text, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["sources"])
+def show_sources(message):
+    sources_text = "📡 **Джерела даних:**\n\n"
+    for i, source in enumerate(SOURCES, 1):
+        sources_text += f"{i}. [{source['name']}]({source['url']})\n"
+
+    bot.reply_to(
+        message,
+        sources_text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
+
+@bot.message_handler(commands=["test"])
+def test_alert(message):
+    test_text = (
+        "🔴⚠️ **ТЕСТОВЕ СПОВІЩЕННЯ**\n\n"
+        "📍 **Локація:** БРОВАРИ\n"
+        "🎯 **Тип:** 🚀 Ракета\n\n"
+        "📋 **Повідомлення:**\n"
+        "_Тестове повідомлення: 2 ракети курс на Бровари_"
+    )
+    bot.reply_to(message, test_text, parse_mode="Markdown")
+
+
+# ==========================================
+# 6. ЗАПУСК БОТА
+# ==========================================
+if __name__ == "__main__":
+    try:
+        bot.remove_webhook()
+        logging.info("Вебхук скинуто")
+    except Exception as e:
+        logging.warning(f"Скидання вебхука: {e}")
+
+    # Запускаємо моніторинг в окремому потоці
+    monitor_thread = threading.Thread(target=monitor_all_sources, daemon=True)
+    monitor_thread.start()
+
+    logging.info("🤖 Бот запущено...")
+
+    # Запускаємо бота
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=1, timeout=60)
+        except Exception as e:
+            logging.error(f"Помилка бота: {e}")
+            time.sleep(5)
